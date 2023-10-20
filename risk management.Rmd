@@ -1,0 +1,634 @@
+---
+title: "Assignment 8"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, eval = FALSE)
+```
+
+```{r}
+rm(list=ls())
+```
+
+<!-- # Libraries and other setup -->
+```{r results="hide", message=FALSE, eval=TRUE}
+# library(broom)
+# library(data.table)
+# library(e1071)
+library(kableExtra)
+# library(gdata)
+# library(ggpubr)
+# library(grid)
+library(gridExtra)
+# library(gtable)
+library(ggpubr)
+library(gridGraphics)
+library(lubridate)
+library(magrittr)
+library(readr)
+# library(readxl)
+# library(reshape2)
+library(tidyverse)
+library(tseries)
+library(zoo)
+
+setwd("D:/Documents/MGT 6090/Assignment 8")
+```
+
+<!-- # Saved env variables -->
+```{r eval=TRUE}
+# contains compustat and crsp_msf data
+# load("base.RData")
+load("out.RData")
+```
+
+```{r}
+save.image(file="out.RData")
+```
+
+
+<!-- # Non data-dependent variables and functions -->
+```{r}
+# Names of descriptive stat functions for plotting in loops
+stat_fns_names <- c("N", "mean", "sd", "skewness", "kurtosis", "min", "1%", "5%", "q25", "median", "q75", "95%", "99%", "max")
+
+# Regex for strings containing negative or positive integers or decimals
+valid_num_regex <- "^-?(0|[1-9]\\d*)(\\.\\d+)?$"
+
+```
+
+
+<!-- # Import DSF data -->
+```{r}
+# Get relevant columns
+dsf_cols <- cols_only(
+  date = col_date(format = "%Y%m%d"),
+  PERMNO = col_double(),
+  RET = col_character(), 
+  vwretd = col_double())
+
+# if data doesn't have date/firm/return value, then data is unusable
+dsf <- read_csv("crsp_dsf_full_filter_vol.csv", col_types = dsf_cols) %>%
+  drop_na()
+
+```
+
+
+# gtID Seed & Random Number
+```{r}
+gtID <- 902953178
+set.seed(gtID)
+start_year <- sample(1980:2010, 1)
+# 1989
+```
+
+```{r eval=TRUE}
+# Output values
+matrix(c(gtID, start_year), dimnames = list(c("gtID Seed", "Random Number"))) %>%
+  knitr::kable() %>%
+  kable_styling(font_size = 8)
+
+```
+
+
+<!-- # Filter dsf data -->
+```{r}
+# get dates for filtering
+start_date <- as.Date(paste(start_year, "01", "01", sep = "-"), format = "%Y-%m-%d")
+# end date is 3 years after so that we can get 36 month data as well for tail risk
+end_date <- as.Date(paste(start_year + 12, "12", "31", sep = "-"), format = "%Y-%m-%d")
+end_date_actual <- as.Date(paste(start_year + 9, "12", "31", sep = "-"), format = "%Y-%m-%d")
+
+# filter to dates we are interested in 
+# filter out returns that are non-numeric
+dsf <- dsf %>%
+  filter(date >= start_date & date <= end_date) %>%
+  filter(str_detect(RET, valid_num_regex) == TRUE) %>%
+  mutate(RET = as.numeric(RET))
+
+# add numeric month_year YYYYmm and year column for filtering and computations
+dsf <- dsf %>%
+  mutate(month_year = as.numeric(format(date, "%Y%m"))) %>%
+  mutate(year = as.numeric(format(date, "%Y")))
+
+```
+
+
+<!-- # Get sample of companies and filter dsf data -->
+```{r}
+companies <- dsf %>%
+  filter(year == start_year) %>%
+  select(PERMNO) %>%
+  unique() %>%
+  pull() %>%
+  sample(100)
+
+dsf <- dsf %>%
+  filter(PERMNO %in% companies)
+
+```
+
+
+<!-- # Import daily risk free rate data and join to dsf -->
+```{r}
+rf <- read_csv("F-F_Research_Data_Factors_daily.csv", skip = 5, n_max = 24811, col_names = c("date", "Mkt-RF", "SMB", "HML", "RF"), col_types = list(col_date(format = "%Y%m%d"), col_double(), col_double(), col_double(), col_double())) %>%
+  drop_na() %>%
+  filter(date >= start_date & date <= end_date) %>%
+  select(date, RF)
+
+# join and calculate relevant columns
+dsf <- dsf %>%
+  left_join(rf, by = "date") %>%
+  mutate(stock_excess = RET - RF/100) %>%
+  mutate(mkt_excess = vwretd - RF/100)
+
+# save.image(file="base.RData")
+
+```
+
+
+<!-- # basic data-dependent functions and variables -->
+```{r}
+# get all month_year (YYYYmm) doubles in the data
+month_years <- dsf %>%
+  select(month_year) %>%
+  pull() %>%
+  unique()
+
+# generate a data frame of all possible PERMNO/month_year pairs
+get_permno_month_years <- function() {
+  expand.grid("PERMNO" = companies, "month_year" = month_years) %>%
+    arrange(PERMNO, month_year)
+}
+
+# will be used with rollapply, given vector/col of values, return NA if all values are NA, and sum non-NA values otherwise
+sum_handle_NA <- function(vals) {
+  ifelse(all(is.na(vals)), NA, sum(vals, na.rm = TRUE))
+}
+```
+
+
+<!-- # Calculate rolling 12 month average market excess returns and demean returns-->
+```{r}
+# for each month, calculate the sum of market excess returns and the number of observations
+# calculate the rolling 12 month sum and rolling 12 month number of observations
+# use the previous values to calculate rolling 12 month mean
+dsf <- dsf %>%
+  group_by(month_year, date) %>%
+  summarise(mkt_excess = median(mkt_excess), .groups = "drop_last") %>%
+  summarise(mkt_excess_month_sum = sum(mkt_excess), 
+            mkt_excess_month_N = length(mkt_excess), .groups = "drop") %>%
+  arrange(month_year) %>%
+  mutate(mkt_excess_12mo_sum = c(rollsum(mkt_excess_month_sum, 12), rep(NA, 11))) %>%
+  mutate(mkt_excess_12mo_N = c(rollsum(mkt_excess_month_N, 12), rep(NA, 11))) %>%
+  mutate(mkt_excess_12mo_avg = mkt_excess_12mo_sum / mkt_excess_12mo_N) %>%
+  select(month_year, mkt_excess_12mo_avg) %>%
+  left_join(dsf, ., by = "month_year")
+
+# repeat but now calculate rolling 12 month mean return for each stock
+dsf <- dsf %>%
+  group_by(PERMNO, month_year) %>%
+  summarise(stock_excess_month_sum = sum(stock_excess), 
+            stock_excess_month_N = length(stock_excess), .groups = "drop") %>%
+  right_join(get_permno_month_years(), by = c("PERMNO", "month_year")) %>%
+  group_by(PERMNO) %>%
+  arrange(month_year, .by_group = TRUE) %>%
+  mutate(stock_excess_12mo_sum = c(rollapply(stock_excess_month_sum, 12, FUN = sum_handle_NA), rep(NA, 11))) %>%
+  mutate(stock_excess_12mo_N = c(rollapply(stock_excess_month_N, 12, FUN = sum_handle_NA), rep(NA, 11))) %>%
+  mutate(stock_excess_12mo_avg = stock_excess_12mo_sum / stock_excess_12mo_N) %>%
+  ungroup() %>%
+  select(PERMNO, month_year, stock_excess_12mo_avg) %>%
+  left_join(dsf, ., by = c("PERMNO", "month_year"))
+
+# Demean excess and market returns
+dsf <- dsf %>%
+  mutate(stock_excess_demean = stock_excess - stock_excess_12mo_avg) %>%
+  mutate(mkt_excess_demean = mkt_excess - mkt_excess_12mo_avg)
+
+```
+
+
+
+<!-- Calculate betas -->
+```{r}
+# Calculate monthly sum of beta return products
+# Join with base table containing all PERMNO across all month_years
+# calculate rolling sums and eventual beta
+betas <- dsf %>%
+  group_by(PERMNO, month_year) %>%
+  summarise(beta_numerator = sum(stock_excess_demean * mkt_excess_demean), 
+            beta_denominator = sum(mkt_excess_demean * mkt_excess_demean), .groups = "drop") %>%
+  right_join(get_permno_month_years(), by = c("PERMNO", "month_year")) %>%
+  group_by(PERMNO) %>%
+  arrange(month_year, .by_group = TRUE) %>%
+  mutate(sum_12mo_numer = c(rollapply(beta_numerator, 12, FUN = sum_handle_NA), rep(NA, 11))) %>%
+  mutate(sum_12mo_denom = c(rollapply(beta_denominator, 12, FUN = sum_handle_NA), rep(NA, 11))) %>%
+  mutate(beta = sum_12mo_numer/sum_12mo_denom) %>%
+  ungroup() %>%
+  select(PERMNO, month_year, beta)
+
+# repeat the same process as above, but this time filtered for market excess below the 12 month mean
+betas <- dsf %>%
+  filter(mkt_excess < mkt_excess_12mo_avg) %>%
+  group_by(PERMNO, month_year) %>%
+  summarise(beta_numerator = sum(stock_excess_demean * mkt_excess_demean), 
+            beta_denominator = sum(mkt_excess_demean * mkt_excess_demean), .groups = "drop") %>%
+  right_join(get_permno_month_years(), by = c("PERMNO", "month_year")) %>%
+  group_by(PERMNO) %>%
+  arrange(month_year, .by_group = TRUE) %>%
+  mutate(sum_12mo_numer = c(rollapply(beta_numerator, 12, FUN = sum_handle_NA), rep(NA, 11))) %>%
+  mutate(sum_12mo_denom = c(rollapply(beta_denominator, 12, FUN = sum_handle_NA), rep(NA, 11))) %>%
+  mutate(downside_beta = sum_12mo_numer/sum_12mo_denom) %>%
+  ungroup() %>%
+  select(PERMNO, month_year, downside_beta) %>%
+  left_join(betas, ., by = c("PERMNO", "month_year"))
+  
+# calculate relative downside beta
+betas <- betas %>%
+  mutate(relative_downside_beta = downside_beta - beta)
+
+```
+
+
+<!-- # Calculate coskewness -->
+```{r}
+# repeat previous steps but use coskewness formula
+betas <- dsf %>%
+  group_by(PERMNO, month_year) %>%
+  summarise(coskew_numer = sum(stock_excess_demean * mkt_excess_demean * mkt_excess_demean),
+            coskew_denom1 = sum(stock_excess_demean * stock_excess_demean), 
+            coskew_denom2 = sum(mkt_excess_demean * mkt_excess_demean), 
+            coskew_T = length(stock_excess_demean), .groups = "drop") %>%
+  right_join(get_permno_month_years(), by = c("PERMNO", "month_year")) %>%
+  group_by(PERMNO) %>%
+  arrange(month_year, .by_group = TRUE) %>%
+  mutate(sum_12mo_numer = c(rollapply(coskew_numer, 12, FUN = sum_handle_NA), rep(NA, 11))) %>%
+  mutate(sum_12mo_denom1 = c(rollapply(coskew_denom1, 12, FUN = sum_handle_NA), rep(NA, 11))) %>%
+  mutate(sum_12mo_denom2 = c(rollapply(coskew_denom2, 12, FUN = sum_handle_NA), rep(NA, 11))) %>%
+  mutate(sum_12mo_T = c(rollapply(coskew_T, 12, FUN = sum_handle_NA), rep(NA, 11))) %>%
+  mutate(coskewness = sum_12mo_numer / (sqrt(sum_12mo_denom1 / sum_12mo_T) * sum_12mo_denom2)) %>%
+  ungroup() %>%
+  select(PERMNO, month_year, coskewness) %>%
+  left_join(betas, ., by = c("PERMNO", "month_year"))
+
+```
+
+
+<!-- # Calculate tail risk -->
+```{r}
+# pool all firm excess returns during each month to get tail threshold
+dsf <- dsf %>%
+  group_by(month_year) %>%
+  summarise(tail_threshold = quantile(stock_excess, 0.05), .groups = "drop") %>%
+  left_join(dsf, ., by = "month_year")
+
+# then compute monthly tail exponent estimate
+tail_exp <- dsf %>%
+  filter(stock_excess <= tail_threshold) %>%
+  group_by(month_year) %>%
+  summarise(tail_exp = 1 / length(stock_excess) * sum(log(stock_excess / tail_threshold)), .groups = "drop")
+
+# last, compute tail risk for each firm-month
+# first calculate firm monthly excess returns
+# then join data
+# next, calculate firm monthly excess return and tail exponent regression over 36 months
+tail_risk_df <- dsf %>%
+  group_by(PERMNO, month_year) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(stock_excess_month_compound = cumprod(1 + stock_excess)) %>%
+  summarise(stock_excess_month = tail(stock_excess_month_compound, n = 1), .groups = "drop")%>%
+  right_join(get_permno_month_years(), by = c("PERMNO", "month_year")) %>%
+  left_join(tail_exp, by = "month_year")
+
+
+get_lm_coef_no_intercept <- function(df) {
+  return(sum(df$xcol * df$ycol) / sum(df$xcol * df$xcol))
+}
+
+roll_reg <- function(y_col, x_col) {
+  temp_df <- data.frame(y_col, x_col)
+  colnames(temp_df) <- c("ycol", "xcol")
+  temp_df %>%
+    rollapply(36, FUN = get_lm_coef_no_intercept)
+}
+
+# calculate simple linear regression by hand
+betas <- tail_risk_df %>%
+  mutate(tail_exp = ifelse(is.na(stock_excess_month), NA, tail_exp)) %>%
+  mutate(xy = stock_excess_month * tail_exp) %>%
+  mutate(x2 = tail_exp * tail_exp) %>%
+  group_by(PERMNO) %>%
+  arrange(month_year, .by_group = TRUE) %>%
+  mutate(reg_numer = c(rollapply(xy, 36, FUN = sum_handle_NA), rep(NA, 35))) %>%
+  mutate(reg_denom = c(rollapply(x2, 36, FUN = sum_handle_NA), rep(NA, 35))) %>%
+  mutate(tail_risk_scalar = reg_numer / reg_denom) %>%
+  select(PERMNO, month_year, tail_risk_scalar) %>%
+  left_join(betas, ., by = c("PERMNO", "month_year"))
+
+```
+
+
+<!-- # Output for 8.1 -->
+# Assignment 8.1
+* All calculated values are inside tables in "Assignment8_1.pdf"
+```{r eval=FALSE}
+# filter out additional values from data needed to compute other values
+out_betas <- betas %>%
+  filter(month_year <= 199812) %>%
+  arrange(PERMNO, month_year)
+
+for (i in 1:length(companies)) {
+  company <- companies[i]
+  out_betas %>%
+    filter(PERMNO == company) %>%
+    knitr::kable(digits = 6, format.args = list(scientific = FALSE)) %>%
+    kable_styling(font_size = 8, latex_options = c("hold_position")) %>%
+    print()
+}
+
+```
+
+
+# Assignment 8.2
+```{r}
+# Calculating value at risk
+
+# narrow down our dfs data anymore (don't need returns past 1998 anymore)
+dsf_tight <- dsf %>%
+  filter(date <= end_date_actual)
+
+# generate histogram of returns
+ret_hist <- dsf_tight %>%
+  select(RET) %>%
+  ggplot(aes(x = RET)) + 
+  geom_histogram(binwidth = 0.01) +
+  coord_cartesian(xlim = c(-0.5, 0.75))
+
+# calculate VaR and ES values
+portfolio_VaR_negative <- dsf_tight %>%
+  select(RET) %>%
+  pull() %>%
+  quantile(0.05)
+
+portfolio_VaR <- portfolio_VaR_negative * -1
+portfolio_VaR_dollar <- portfolio_VaR * 100000000
+
+portfolio_ES_negative <- dsf_tight %>%
+  filter(RET <= portfolio_VaR_negative) %>%
+  select(RET) %>%
+  pull() %>%
+  mean()
+
+portfolio_ES <- portfolio_ES_negative * -1
+
+```
+
+
+### 1. Histogram of returns from January 1989 - December 1998
+```{r eval=TRUE}
+ret_hist
+```
+
+
+\newpage
+### 1. Calculated VaR, $VaR, and ES
+```{r eval=TRUE}
+# VaR and ES outputs
+out_8_2_1 <- matrix(c(portfolio_VaR, portfolio_VaR_dollar, portfolio_ES), nrow = 3, ncol = 1, dimnames = list(c("VaR", "$VaR", "ES")))
+out_8_2_1 %>%
+  knitr::kable(digits = 6, format.args = list(scientific = FALSE)) %>%
+  kable_styling(font_size = 8, latex_options = c("hold_position"))
+  
+```
+
+
+<!-- # Repeat for January 2000 to December 2010-->
+```{r}
+# need to reimport dsf data to get new bounds
+start_date_new <- as.Date("2000-01-01", format = "%Y-%m-%d")
+end_date_new <- as.Date("2010-12-31", format = "%Y-%m-%d")
+
+# import and filter
+dsf2 <- read_csv("crsp_dsf_full_filter_vol.csv", col_types = dsf_cols) %>%
+  drop_na() %>%
+  filter(date >= start_date_new & date <= end_date_new) %>%
+  filter(str_detect(RET, valid_num_regex) == TRUE) %>%
+  mutate(RET = as.numeric(RET)) %>%
+  filter(PERMNO %in% companies)
+
+# generate histogram of returns
+ret_hist2 <- dsf2 %>%
+  select(RET) %>%
+  ggplot(aes(x = RET)) + 
+  geom_histogram(binwidth = 0.01) +
+  coord_cartesian(xlim = c(-0.5, 0.75))
+
+# calculate VaR and ES values
+portfolio_VaR_negative2 <- dsf2 %>%
+  select(RET) %>%
+  pull() %>%
+  quantile(0.05)
+
+portfolio_VaR2 <- portfolio_VaR_negative2 * -1
+portfolio_VaR_dollar2 <- portfolio_VaR2 * 100000000
+
+portfolio_ES_negative2 <- dsf2 %>%
+  filter(RET <= portfolio_VaR_negative2) %>%
+  select(RET) %>%
+  pull() %>%
+  mean()
+
+portfolio_ES2 <- portfolio_ES_negative2 * -1
+
+```
+
+### 2. Histogram of returns from January 2000 - December 2010
+```{r eval=TRUE}
+ret_hist2
+```
+
+### 2. Calculated VaR, $VaR, and ES
+```{r eval=TRUE}
+# VaR and ES outputs
+out_8_2_2 <- matrix(c(portfolio_VaR2, portfolio_VaR_dollar2, portfolio_ES2), nrow = 3, ncol = 1, dimnames = list(c("VaR", "$VaR", "ES")))
+out_8_2_2 %>%
+  knitr::kable(digits = 6, format.args = list(scientific = FALSE)) %>%
+  kable_styling(font_size = 8, latex_options = c("hold_position"))
+  
+```
+* Both functions have normal-like distributions, centered around 0. However the January 2000 to December 2010 distribution looks like it has has lower kurtosis and higher variance. There are less data points because not all the sampled firms had returns in the later time period. But relatively, the January 2000 to December 2010 distribution has less values closer to 0, and more values spread out. This could be from containing two periods of high instability: dotcom bubble and Great Recession.
+
+* The value at risk and expected shortfall of the returns from January 1989 to December 1998 are higher than than those from January 2000 to December 2020. This means there are more negative outliers in the later set of returns. This is interesting, as the data is more variant, but has less risk at the extreme negative tail.
+
+
+<!-- # Calculating RiskMetrics Model -->
+```{r}
+# get list of trading dates
+dates_vec <- dsf2 %>%
+  select(date) %>%
+  unique() %>%
+  arrange(date) %>%
+  pull()
+
+# get updated vector of sampled companies that have values from Jan 2000 to Dec 2010
+companies_2000 <- dsf2 %>%
+  select(PERMNO) %>%
+  pull() %>%
+  unique() %>%
+  sort()
+
+# for output, calculate companies that no longer exist
+companies_gone <- setdiff(companies, companies_2000)
+
+# generate data frame with all dates for each permno
+get_permno_dates <- function() {
+  expand.grid("PERMNO" = companies_2000, "date" = dates_vec) %>%
+    arrange(PERMNO, date)
+}
+
+# generate initial annualized variances
+init_var <- dsf2 %>%
+  group_by(PERMNO) %>%
+  summarise(var_0 = var(RET) / 365, .groups = "drop") 
+
+get_init_var <- function(company) {
+  init_var %>%
+    filter(PERMNO == company) %>%
+    select(var_0) %>%
+    pull()
+}
+
+# need to calculate initial and final trading dates for each stock
+first_last_dates <- dsf2 %>%
+  select(PERMNO, date) %>%
+  group_by(PERMNO) %>%
+  arrange(date, .by_group = TRUE) %>%
+  summarise(init_ret_date = head(date, n = 1), last_ret_date = tail(date, n = 1), .groups = "drop")
+
+
+# join with all dates and returns
+first_last_dates <- first_last_dates %>%
+  left_join(get_permno_dates(), ., by = "PERMNO") %>%
+  filter(date >= init_ret_date & date <= last_ret_date) %>%
+  arrange(PERMNO, date)
+
+first_last_dates <- dsf2 %>%
+  select(PERMNO, date, RET) %>%
+  left_join(first_last_dates, ., by = c("PERMNO", "date"))
+
+first_last_dates <- first_last_dates %>%
+  mutate(RET = ifelse(is.na(RET), 0, RET))
+
+# calulate recursive riskmetrics values
+get_riskmetrics_vals <- function(date_ret_df, company) {
+  n <- nrow(date_ret_df)
+  date_vol_df <- date_ret_df %>%
+    select(date)
+  ret_vec <- date_ret_df %>%
+    select(RET) %>%
+    pull()
+  y_0 <- get_init_var(company)
+  vals <- vector(mode = "numeric", length = n)
+  vals[1] <- y_0
+  for(i in 2:n) {
+
+    vals[i] <- 0.94 * vals[i-1] + 0.06 * ret_vec[i-1] ^ 2
+  }
+  date_vol_df$volatility = vals
+  return(date_vol_df)
+}
+
+# store our plots
+plist <- list()
+
+for(j in 1:length(companies_2000)) {
+  company <- companies_2000[j]
+  plist[[j]] <- first_last_dates %>%
+    filter(PERMNO == company) %>%
+    select(date, RET) %>%
+    get_riskmetrics_vals(company) %>%
+    ggplot(aes(x = date, y = volatility)) + 
+    geom_line() + 
+    ggtitle(paste("RiskMetrics Model for PERMNO", company, sep = " "))
+}
+```
+
+
+<!-- # Calculate GARCH vals -->
+```{r}
+garch_coefs_df <- dsf %>%
+  select(PERMNO, date, RET) %>%
+  group_by(PERMNO) %>%
+  arrange(date, .by_group = TRUE) %>%
+  summarise(garch_omega = garch(RET, order = c(1, 1))$coef[["a0"]], 
+            garch_beta = garch(RET, order = c(1, 1))$coef[["b1"]],
+            garch_alpha = garch(RET, order = c(1, 1))$coef[["a1"]], .groups = "drop")
+
+get_garch_coefs <- function(company) {
+  garch_coefs_df %>%
+    filter(PERMNO == company) %>%
+    select(garch_omega, garch_beta, garch_alpha) %>%
+    as.numeric()
+}
+
+# calulate recursive garch (1, 1) values
+get_garch_vals <- function(date_ret_df, company) {
+  n <- nrow(date_ret_df)
+  date_vol_df <- date_ret_df %>%
+    select(date)
+  ret_vec <- date_ret_df %>%
+    select(RET) %>%
+    pull()
+  garch_coefs <- get_garch_coefs(company)
+  y_0 <- get_init_var(company)
+  vals <- vector(mode = "numeric", length = n)
+  vals[1] <- y_0
+  for(i in 2:n) {
+
+    vals[i] <- garch_coefs[1] + garch_coefs[2] * vals[i-1] + garch_coefs[3] * ret_vec[i-1] ^ 2
+  }
+  date_vol_df$volatility = vals
+  return(date_vol_df)
+}
+
+# store our plots
+plist_garch <- list()
+
+for(j in 1:length(companies_2000)) {
+  company <- companies_2000[j]
+  plist_garch[[j]] <- first_last_dates %>%
+    filter(PERMNO == company) %>%
+    select(date, RET) %>%
+    get_garch_vals(company) %>%
+    ggplot(aes(x = date, y = volatility)) + 
+    geom_line() +
+    ggtitle(paste("GARCH (1, 1) Model for PERMNO", company, sep = " "))
+}
+
+```
+
+
+# Assignment 8.3
+* There are only 44 plots for these because the other 56 sampled firms did not have any data available from January 2000 to December 2010.
+* RiskMetrics and GARCH(1,1) plots are in the file "Assignment8_3.pdf".
+* The GARCH(1,1) plots and the RiskMetrics plots have very similar shapes. However, the GARCH(1,1) models tend to have higher peaks in the volatility calculations. The GARCH(1,1) plots also look like they are little bit noisier than the RiskMetrics plots. This could mean that with our estimated parameters, the GARCH(1,1) model is a lot more sensative to volatility than the RiskMetrics plot.
+
+```{r}
+# output plots
+pdf("Assignment8_3.pdf")
+for (i in 1:length(companies_2000)) {
+  print(ggarrange(plist[[i]], plist_garch[[i]], ncol = 1, nrow = 2))
+}
+dev.off
+```
+
+
+
+
+
+
+
+
+
+
